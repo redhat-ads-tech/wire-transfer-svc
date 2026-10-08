@@ -1,0 +1,35 @@
+= Acme Wire Transfer Service
+
+A legacy Struts 1.x web application that processes customer wire transfers for Acme Inc.'s online banking platform.
+
+== Risk Classification
+
+*High Risk* — This is a customer-facing, revenue-generating service subject to financial compliance requirements (PCI-DSS, SOX). Downtime or security incidents have direct business impact.
+
+== Purpose
+
+This application is a sample used in the https://github.com/rhpds/lightwell-workshop[Lightwell Workshop] at Red Hat One. It is intentionally built with outdated dependencies containing known vulnerabilities (CVEs). During the workshop, participants use Red Hat Lightwell to identify, assess, and remediate these vulnerabilities through both AI-driven (Ansible Automation Platform + OpenCode agents) and deterministic (Renovate) remediation paths.
+
+== Known Vulnerable Dependencies
+
+[cols="2,1,2",options="header"]
+|===
+| Dependency | Version | Notes
+| Apache Struts 1.x | 1.3.10 | End-of-life framework with multiple critical CVEs
+| H2 Database | 1.4.200 | Embedded database with known RCE vulnerabilities
+| Commons DBCP | 1.4 | Legacy connection pooling with known issues
+| Commons Logging | 1.2 | Older logging framework
+|===
+
+== Build
+
+[source,bash]
+----
+mvn package -DskipTests
+----
+
+Produces `target/wire-transfer-svc.war`.
+
+== License
+
+Sample code for demonstration purposes only. Not intended for production use.
