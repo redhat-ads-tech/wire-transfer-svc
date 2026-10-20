@@ -322,7 +322,29 @@
     
     <div class="footer">
         Acme Inc. Bank &copy; 2024 - Internal Banking System
+        <div id="revision" style="color:#999;font-size:11px;margin-top:4px"></div>
     </div>
+<script>
+(function(){
+  fetch('/revision.json').then(function(r){return r.json()}).then(function(d){
+    var ago='';
+    if(d.date){
+      var ms=Date.now()-new Date(d.date).getTime();
+      var s=Math.floor(ms/1000),m=Math.floor(s/60),h=Math.floor(m/60);
+      if(h>=24){ago=new Date(d.date).toLocaleString()}
+      else if(h>=1){ago=h+' hour'+(h>1?'s':'')+' ago'}
+      else if(m>=1){ago=m+' minute'+(m>1?'s':'')+' ago'}
+      else{ago='just now'}
+    }
+    var sha=d.sha&&d.sha!=='unknown'?d.sha.substring(0,8):'';
+    var parts=[];
+    if(sha)parts.push(sha);
+    if(d.message&&d.message!=='local build')parts.push(d.message);
+    if(ago)parts.push(ago);
+    if(parts.length)document.getElementById('revision').textContent='Build: '+parts.join(' \u00b7 ');
+  }).catch(function(){});
+})();
+</script>
 </body>
 </html>
 
