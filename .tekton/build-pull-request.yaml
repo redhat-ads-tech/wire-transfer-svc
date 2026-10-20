@@ -23,6 +23,8 @@ spec:
       value: "{{ repo_url }}"
     - name: project-path
       value: "{{ repo_owner }}/{{ repo_name }}"
+    - name: target-branch
+      value: "{{ target_branch }}"
   pipelineSpec:
     params:
       - name: repo-url
@@ -31,6 +33,7 @@ spec:
       - name: mr-iid
       - name: gitlab-api-url
       - name: project-path
+      - name: target-branch
     tasks:
       - name: fetch-source
         taskRef:
@@ -67,13 +70,94 @@ spec:
           - { name: GOALS, value: ["verify", "org.cyclonedx:cyclonedx-maven-plugin:2.7.11:makeAggregateBom", "--fail-never"] }
           - { name: MAVEN_MIRROR_URL, value: "$(params.maven-mirror-url)" }
 
+      # Regression: run the same test code again against the target branch's
+      # pom.xml. Only pom.xml is rewound, so a difference in outcomes is
+      # attributable to the dependency version and nothing else. The head
+      # reports are stashed first and restored afterwards, so the Unit and
+      # Integration rows keep reporting the change under review, not the
+      # baseline. Reuses the settings.xml run-tests already generated, and is
+      # allowed to fail: a missing baseline leaves the row honest, not red.
+      - name: baseline-tests
+        runAfter: [run-tests]
+        workspaces:
+          - { name: source, workspace: source }
+        params:
+          - { name: GITLAB_API_URL, value: "$(params.gitlab-api-url)" }
+          - { name: PROJECT_PATH, value: "$(params.project-path)" }
+          - { name: TARGET_BRANCH, value: "$(params.target-branch)" }
+        taskSpec:
+          params:
+            - { name: GITLAB_API_URL }
+            - { name: PROJECT_PATH }
+            - { name: TARGET_BRANCH }
+          workspaces:
+            - name: source
+          steps:
+            - name: baseline
+              image: registry.access.redhat.com/ubi9/openjdk-17:latest
+              workingDir: $(workspaces.source.path)
+              env:
+                - name: GITLAB_TOKEN
+                  valueFrom:
+                    secretKeyRef: { name: gitlab-pac-token, key: token }
+              script: |
+                #!/usr/bin/env bash
+                set -u
+                # Build the baseline in its own copied tree. -D maven.build.directory
+                # does not move project.build.directory, so the baseline run still
+                # wrote into target/ -- owned by the maven task's UID -- and died on
+                # "Operation not permitted" before any test ran. Worse, target/ then
+                # still held the head reports, so comparing them produced a confident
+                # "0 regressions" that measured nothing.
+                BL="$(workspaces.source.path)/baseline-build"
+                rm -rf "$BL" && mkdir -p "$BL"
+                API="$(echo "$(params.GITLAB_API_URL)" | cut -d/ -f1-3)/api/v4"
+                ENC="$(python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=""))' "$(params.PROJECT_PATH)")"
+                if ! curl -sfk -H "PRIVATE-TOKEN: ${GITLAB_TOKEN}" \
+                     "${API}/projects/${ENC}/repository/files/pom.xml/raw?ref=$(params.TARGET_BRANCH)" \
+                     -o "$BL/pom.xml"; then
+                  echo "LW-BASELINE: could not fetch pom.xml from $(params.TARGET_BRANCH); skipping"
+                  exit 0
+                fi
+                if cmp -s "$BL/pom.xml" pom.xml; then
+                  echo "LW-BASELINE: pom.xml matches the target branch; nothing to compare"
+                  rm -rf "$BL"; exit 0
+                fi
+                cp -a src "$BL"/ 2>/dev/null
+                [ -d .mvn ] && cp -a .mvn "$BL"/ 2>/dev/null
+                ( cd "$BL" && mvn -B verify --fail-never \
+                    -s "$(workspaces.source.path)/maven-generate/settings.xml" \
+                    -Dmaven.repo.local="$(workspaces.source.path)/.m2/repository" )
+                n=$(find "$BL/target" -name 'TEST-*.xml' 2>/dev/null | wc -l | tr -d ' ')
+                echo "LW-BASELINE: ${n} baseline test report(s)"
+                # Never fail the pipeline here: a baseline that will not build is
+                # reported as an unmeasurable regression row, not a broken MR.
+                exit 0
+                fi
+                if cmp -s /tmp/pom.baseline pom.xml; then
+                  echo "LW-BASELINE: pom.xml matches the target branch; nothing to compare"
+                  exit 0
+                fi
+                cp pom.xml /tmp/pom.head && cp /tmp/pom.baseline pom.xml
+                mvn -B verify --fail-never -s maven-generate/settings.xml \
+                  -Dmaven.repo.local="$(workspaces.source.path)/.m2/repository" \
+                  -Dmaven.build.directory="$(workspaces.source.path)/target-baseline"
+                rc=$?
+                cp /tmp/pom.head pom.xml
+                n=$(find target-baseline -name 'TEST-*.xml' 2>/dev/null | wc -l | tr -d ' ')
+                echo "LW-BASELINE: mvn rc=${rc}, ${n} baseline test report(s)"
+                # Never fail the pipeline here: a baseline that would not
+                # build is reported as an unmeasurable regression row, not as
+                # a broken merge request.
+                exit 0
+
       # Fills the Automated Validation table on the merge request opened by the
       # Lightwell remediation agent. Rewrites only the text between the
       # lw:validation / lw:action markers, so the Summary and Vulnerability
       # Details the agent wrote are preserved. A merge request that has no
       # markers (a human one, say) is left alone.
       - name: report-validation
-        runAfter: [run-tests]
+        runAfter: [baseline-tests]
         taskSpec:
           params:
             - { name: MR_IID }
@@ -126,6 +210,12 @@ spec:
                     t = f = e = s = 0
                     found = False
                     for p in glob.glob(pattern, recursive=True):
+                        # baseline-build/ holds the pre-bump run that
+                        # baseline-tests produced. It must not be counted here
+                        # or every total doubles and the rows describe the two
+                        # builds added together instead of the change itself.
+                        if "baseline-build" in p.split(os.sep):
+                            continue
                         try:
                             root = ET.parse(p).getroot()
                         except ET.ParseError:
@@ -315,6 +405,63 @@ spec:
                         results["signature"] = {"status": "failed",
                             "details": f"could not verify the artifact against Nexus: {exc}"}
 
+                    # Regression: the same test code against the target branch's
+                    # pom, run by baseline-tests into baseline-build/. Comparing
+                    # per-test outcomes rather than totals means a test that
+                    # was already red before the bump is not blamed on it.
+                    def outcomes(root):
+                        files = glob.glob(os.path.join(root, "**", "TEST-*.xml"), recursive=True)
+                        if not files:
+                            return None
+                        got = {}
+                        for f in files:
+                            try:
+                                r = ET.parse(f).getroot()
+                            except ET.ParseError:
+                                continue
+                            for tc in r.iter("testcase"):
+                                nm = "%s.%s" % (tc.get("classname", "?"), tc.get("name", "?"))
+                                res = "passed"
+                                for ch in tc:
+                                    tag = ch.tag.lower()
+                                    if tag in ("failure", "error"):
+                                        res = tag
+                                        break
+                                    if tag == "skipped":
+                                        res = "skipped"
+                                got[nm] = res
+                        return got
+
+                    base_out, head_out = outcomes("baseline-build/target"), outcomes("target")
+                    if head_out is None:
+                        pass  # no tests ran at all; the test rows already say so
+                    elif base_out is None:
+                        results["regression"] = {"status": "warning",
+                            "details": f"{len(head_out)} tests ran against the remediated build, "
+                                       "but no baseline was produced, so no behavioural "
+                                       "comparison was possible"}
+                    else:
+                        broke = sorted(n for n in base_out
+                                       if base_out[n] == "passed" and head_out.get(n) in ("failure", "error"))
+                        gone = sorted(set(base_out) - set(head_out))
+                        fixed = sorted(n for n in base_out
+                                       if base_out[n] in ("failure", "error") and head_out.get(n) == "passed")
+                        if broke:
+                            shown = ", ".join(broke[:3]) + (f" and {len(broke) - 3} more" if len(broke) > 3 else "")
+                            results["regression"] = {"status": "failed",
+                                "details": f"{len(broke)} test(s) pass on the base branch and fail "
+                                           f"with this change: {shown}"}
+                        elif gone:
+                            shown = ", ".join(gone[:3]) + (f" and {len(gone) - 3} more" if len(gone) > 3 else "")
+                            results["regression"] = {"status": "warning",
+                                "details": f"{len(gone)} test(s) present on the base branch no "
+                                           f"longer run: {shown}"}
+                        else:
+                            det = f"behavioural diff: 0 regressions across {len(head_out)} tests"
+                            if fixed:
+                                det += f"; {len(fixed)} previously failing test(s) now pass"
+                            results["regression"] = {"status": "passed", "details": det}
+
                     # Licence: compare what the base version declares with what
                     # the remediated build declares. A rebuild must not change it.
                     try:
@@ -455,6 +602,25 @@ spec:
                 desc = splice(desc, AS_, AE, action)
                 call("PUT", f"/projects/{proj}/merge_requests/{iid}", {"description": desc})
                 print(f"Updated MR !{iid}: {sorted(results)}")
+
+                # Gate the merge on the table, not merely on the build. GitLab
+                # can only see whether this pipeline succeeded, so the pipeline
+                # has to go red when a row is not green -- otherwise
+                # only_allow_merge_if_pipeline_succeeds happily releases a merge
+                # request whose checks still say Pending.
+                #
+                # Deliberately strict: warning and pending block too. Both mean
+                # "not established", and the point of the gate is that a green
+                # table is the only thing that opens the button. risk_class is
+                # excluded because it reports a classification, not a check.
+                not_green = [(lab, (results.get(k) or {}).get("status") or "pending")
+                             for k, lab in CHECKS
+                             if k != "risk_class"
+                             and (results.get(k) or {}).get("status") != "passed"]
+                if not_green:
+                    sys.exit("Automated validation is not green: "
+                             + "; ".join(f"{lab} is {st}" for lab, st in not_green))
+                print("All automated checks passed; the merge request is clear to merge.")
         workspaces:
           - { name: source, workspace: source }
         params:
