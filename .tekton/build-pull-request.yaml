@@ -320,7 +320,13 @@ spec:
                     try:
                         # Parent POMs are never republished, so the remediated
                         # build falls back to the mirror as it walks upward.
-                        lo = licences_for([mirror], group, artifact, old_v)
+                        # The baseline is whatever the pom had before, which
+                        # after the first remediation is itself an .rhlw
+                        # version living only in the hosted repo -- so search
+                        # both, or every second bump reports "baseline
+                        # declared none" and passes for the wrong reason.
+                        lo = licences_for([mirror, f"{nexus}/repository/{LW_REPO}"],
+                                          group, artifact, old_v)
                         ln = licences_for([f"{nexus}/repository/{LW_REPO}", mirror],
                                           group, artifact, new_v)
                         # Always write a result. The old guard skipped the row
@@ -335,6 +341,10 @@ spec:
                         elif not ln:
                             results["license"] = {"status": "warning",
                                 "details": f"the remediated POM declares no licence (was {', '.join(lo)})"}
+                        elif lo is None:
+                            results["license"] = {"status": "passed",
+                                "details": f"{', '.join(ln)}; baseline {old_v} could not be "
+                                           "retrieved, so no change could be detected"}
                         elif not lo:
                             results["license"] = {"status": "passed",
                                 "details": f"{', '.join(ln)} (baseline declared none)"}
