@@ -194,6 +194,60 @@ spec:
                         names = [e.text.strip() for e in root.findall(".//licenses/license/name") if e.text]
                     return names
 
+                def parent_of(pom):
+                    """The <parent> coordinate of a POM, if it declares one."""
+                    try:
+                        root = ET.fromstring(pom)
+                    except ET.ParseError:
+                        return None
+                    ns = {"m": "http://maven.apache.org/POM/4.0.0"}
+                    # `find(...) or find(...)` is wrong: an Element with no children is falsy.
+                    p = root.find("m:parent", ns)
+                    if p is None:
+                        p = root.find("parent")
+                    if p is None:
+                        return None
+                    vals = []
+                    for tag in ("groupId", "artifactId", "version"):
+                        e = p.find("m:" + tag, ns)
+                        if e is None:
+                            e = p.find(tag)
+                        if e is None or not (e.text or "").strip():
+                            return None
+                        vals.append(e.text.strip())
+                    return vals
+
+                def licences_for(bases, group, artifact, version, depth=4):
+                    """Licences for a coordinate, following <parent> the way Maven does.
+
+                    Most artifacts declare no <licenses> of their own. commons-text inherits
+                    Apache-2.0 from commons-parent -> org.apache:apache, so reading only its
+                    own POM found nothing and left this row Pending for the one dependency
+                    the lab is built around. h2 was unaffected because it declares its
+                    licences inline, which is why the bug looked intermittent.
+
+                    Returns None only when nothing in the chain could be fetched at all.
+                    """
+                    g, a, v = group, artifact, version
+                    for hop in range(depth):
+                        pom = None
+                        for b in bases:
+                            try:
+                                pom = fetch("%s/%s/%s/%s/%s-%s.pom" % (b, g.replace(".", "/"), a, v, a, v))
+                                break
+                            except Exception:
+                                continue
+                        if pom is None:
+                            return None if hop == 0 else []
+                        names = licences(pom)
+                        if names:
+                            return names
+                        nxt = parent_of(pom)
+                        if not nxt:
+                            return []
+                        g, a, v = nxt
+                    return []
+
                 def coords(desc):
                     m = re.search(r"```json\n(.*?)\n```", desc, re.S)
                     if not m:
@@ -264,19 +318,32 @@ spec:
                     # Licence: compare what the base version declares with what
                     # the remediated build declares. A rebuild must not change it.
                     try:
-                        old_pom = fetch(f"{mirror}/{group.replace('.','/')}/{artifact}/{old_v}/{artifact}-{old_v}.pom")
-                        new_pom = fetch(f"{nexus}/repository/{LW_REPO}/{group.replace('.','/')}/{artifact}/{new_v}/{artifact}-{new_v}.pom")
-                        lo, ln = licences(old_pom), licences(new_pom)
-                        if lo is not None and ln is not None and (lo or ln):
-                            if not ln:
-                                results["license"] = {"status": "warning",
-                                    "details": f"the remediated POM declares no licence (was {', '.join(lo)})"}
-                            elif norm_lic(lo) == norm_lic(ln):
-                                results["license"] = {"status": "passed",
-                                    "details": f"{', '.join(ln)} (unchanged)"}
-                            else:
-                                results["license"] = {"status": "warning",
-                                    "details": f"licence changed: {', '.join(lo) or 'none'} -> {', '.join(ln)}"}
+                        # Parent POMs are never republished, so the remediated
+                        # build falls back to the mirror as it walks upward.
+                        lo = licences_for([mirror], group, artifact, old_v)
+                        ln = licences_for([f"{nexus}/repository/{LW_REPO}", mirror],
+                                          group, artifact, new_v)
+                        # Always write a result. The old guard skipped the row
+                        # whenever both sides were empty, which is exactly the
+                        # inherited-licence case, and left it Pending forever.
+                        if ln is None:
+                            results["license"] = {"status": "failed",
+                                "details": f"could not read the POM for {artifact} {new_v}"}
+                        elif not ln and not lo:
+                            results["license"] = {"status": "warning",
+                                "details": "neither version declares a licence anywhere in its parent chain"}
+                        elif not ln:
+                            results["license"] = {"status": "warning",
+                                "details": f"the remediated POM declares no licence (was {', '.join(lo)})"}
+                        elif not lo:
+                            results["license"] = {"status": "passed",
+                                "details": f"{', '.join(ln)} (baseline declared none)"}
+                        elif norm_lic(lo) == norm_lic(ln):
+                            results["license"] = {"status": "passed",
+                                "details": f"{', '.join(ln)} (unchanged)"}
+                        else:
+                            results["license"] = {"status": "warning",
+                                "details": f"licence changed: {', '.join(lo) or 'none'} -> {', '.join(ln)}"}
                     except Exception as exc:
                         results["license"] = {"status": "failed",
                             "details": f"could not compare licences: {exc}"}
