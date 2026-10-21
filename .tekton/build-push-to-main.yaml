@@ -100,6 +100,8 @@ spec:
             value: >-
               --label org.opencontainers.image.source=$(params.repo-url)
               --label org.opencontainers.image.revision=$(params.revision)
+              --build-arg=COMMIT_SHA=$(params.revision)
+              '--build-arg=COMMIT_MSG=$(params.commit-title)'
       - name: generate-upload-sbom
         runAfter: [build-image]
         taskSpec:
